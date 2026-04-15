@@ -1,0 +1,32 @@
+services:
+  notebook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecr_notebook
+    ports:
+      - "8890:8890"
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: "Agg"
+      TZ: "${TZ:-Etc/UTC}"
+      JUPYTER_TOKEN: "sysdereco"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      NVIDIA_DISABLE_REQUIRE: "1"
+    gpus:
+      - driver: nvidia
+        count: all
+        capabilities: [compute, utility]
+    command: >
+      bash -lc "jupyter lab
+      --ip=0.0.0.0
+      --port=8890
+      --no-browser
+      --NotebookApp.token=sysdereco
+      --NotebookApp.allow_origin='*'
+      --allow-root"
+
