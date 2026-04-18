@@ -1,0 +1,47 @@
+# Git / CI
+.git
+.github
+.gitignore
+.gitattributes
+
+# Editeur / IDE
+.vscode
+.idea
+.cursor
+*.swp
+*.swo
+
+# Python caches
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Notebook checkpoints
+.ipynb_checkpoints
+
+# Environnements virtuels
+.venv
+venv
+env
+
+# Archives / modeles fournis au runtime (montes via compose)
+data
+results
+ECR
+*.zip
+
+# Caches HF / torch / pip (volume docker)
+.cache
+*.pt
+*.bin
+*.safetensors
+
+# Docs volumineux / PDF
+*.pdf
+
+# Logs
+*.log
+logs
