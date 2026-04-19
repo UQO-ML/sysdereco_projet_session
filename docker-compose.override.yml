@@ -1,0 +1,57 @@
+# Override optionnel pour lancer le scorer Qwen2.5-32B-AWQ dans un container
+# DEDIE, sur le meme reseau que le notebook.
+#
+#   docker compose --profile scorer up -d scorer
+#
+# Cela permet de scorer des generations PENDANT qu'un training tourne dans le
+# container principal (a condition que la VRAM le supporte : 20 GB Qwen AWQ +
+# ~8 GB train_rec -> OK sur 32 GB 5090). Sinon, sequentiel : on lance scorer
+# APRES avoir libere la VRAM (phase 4 du runbook).
+#
+# Le service est dans un profil `scorer` : il ne demarre PAS par defaut.
+
+services:
+  scorer:
+    image: sysdereco/ecr-notebook:latest
+    depends_on:
+      - notebook
+    container_name: ecr_scorer
+    profiles:
+      - scorer
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/workspace
+      - hf_cache:/workspace/.cache/huggingface
+      - torch_cache:/workspace/.cache/torch
+    working_dir: /workspace
+    environment:
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: "/workspace/.cache/huggingface"
+      HUGGINGFACE_HUB_CACHE: "/workspace/.cache/huggingface/hub"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      NVIDIA_DISABLE_REQUIRE: "1"
+    shm_size: "8gb"
+    gpus:
+      - driver: nvidia
+        count: all
+        capabilities: [compute, utility]
+    # Demarre vllm serve Qwen2.5-32B-AWQ en mode serveur OpenAI-compat.
+    # max-model-len=4096 suffit pour les prompts Appendix E (< 2k tokens in,
+    # < 100 tokens out). awq quantization = 4-bit poids ~20 GB.
+    command: >
+      bash -lc "vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ
+      --quantization awq
+      --port 8000
+      --host 0.0.0.0
+      --max-model-len 4096
+      --gpu-memory-utilization 0.5"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -fsSL http://localhost:8000/health >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      start_period: 600s
+      retries: 5

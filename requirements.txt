@@ -45,7 +45,22 @@ sacrebleu
 bert-score
 
 # --- LoRA / ECR[Llama 2-Chat] (Section 4.3) -----------------------------
+# Llama 2-7B-Chat fine-tuning LoRA (bf16) ; quantization 4-bit via bnb si VRAM limite.
 bitsandbytes; platform_system == "Linux"
+
+# --- Flash-Attention 2 (optimisation Llama 2 inference + LoRA training) --
+# flash-attn 2.8+ supporte Blackwell sm_120 (RTX 5090). Build prend 5-10min.
+# Fallback automatique vers `sdpa` si l'install echoue (cf. src/ecr/llama_runner.py).
+# Commenter si la compilation plante (rare sur NGC 26.03 avec CUDA 12.8 deja present).
+flash-attn>=2.8; platform_system == "Linux"
+
+# --- Inference rapide Llama 2 + serveur scorer Qwen2.5 (Section 5.6) ----
+# vLLM sert a la fois :
+#   - la generation Llama 2-7B-Chat zero-shot + ECR[Llama 2-Chat] (debit x3-5 vs pipeline),
+#   - le scorer local Qwen2.5-32B-Instruct-AWQ (remplace GPT-4-turbo, gratuit).
+# openai : client HTTP (vLLM expose une API OpenAI-compatible sur /v1/chat/completions).
+vllm>=0.6; platform_system == "Linux"
+openai>=1.30
 
 # --- Runtime ECR (requis par src_emo/train_*.py et dataset_dbpedia.py) --
 wandb
