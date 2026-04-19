@@ -62,7 +62,7 @@ RUN mkdir -p "${NLTK_DATA}" && \
         punkt punkt_tab stopwords wordnet averaged_perceptron_tagger omw-1.4
 
 # Code du projet (remplace au runtime par le bind-mount de docker-compose)
-COPY . /workspace
+# COPY . /workspace
 
 # Pre-cree les dossiers que le notebook attend (l'archive `emo_data` / `ckpt`
 # et le clone `ECR/` sont fournis au runtime).
