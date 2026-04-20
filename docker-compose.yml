@@ -1,0 +1,69 @@
+name: sysdereco-ecr
+
+services:
+  notebook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        JUPYTER_PORT: "8890"
+    image: sysdereco/ecr-notebook:latest
+    container_name: ecr_notebook
+    restart: unless-stopped
+    ports:
+      - "8890:8890"
+    volumes:
+      # Code + notebook (bind-mount en direct du projet)
+      - ./:/workspace
+      # Caches persistes (modeles HF, datasets, torch hub) pour ne pas re-telecharger
+      - hf_cache:/workspace/.cache/huggingface
+      - torch_cache:/workspace/.cache/torch
+    working_dir: /workspace
+    environment:
+      # Notebook
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: "Agg"
+      TZ: "${TZ:-Etc/UTC}"
+      JUPYTER_PORT: "8890"
+      JUPYTER_TOKEN: "sysdereco"
+      # Hugging Face : ajoutez HF_TOKEN dans un .env pour Llama 2-7B-Chat (gated)
+      HF_HOME: "/workspace/.cache/huggingface"
+      HUGGINGFACE_HUB_CACHE: "/workspace/.cache/huggingface/hub"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      # wandb : offline (les scripts ECR importent wandb sans y logger)
+      WANDB_MODE: "${WANDB_MODE:-disabled}"
+      WANDB_DISABLED: "${WANDB_DISABLED:-true}"
+      # GPU NVIDIA
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      NVIDIA_DISABLE_REQUIRE: "1"
+      # Accelerate : pas d'interactivite dans le container
+      ACCELERATE_DISABLE_RICH: "1"
+    # DataLoader workers HF / PyG : /dev/shm par defaut (64 Mo) est trop petit
+    shm_size: "16gb"
+    # Allocation GPU Compose v2+
+    gpus:
+      - driver: nvidia
+        count: all
+        capabilities: [compute, utility]
+    command: >
+      bash -lc "jupyter lab
+      --ip=0.0.0.0
+      --port=8890
+      --no-browser
+      --ServerApp.token=${JUPYTER_TOKEN:-sysdereco}
+      --ServerApp.allow_origin='*'
+      --ServerApp.root_dir=/workspace
+      --allow-root"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -fsSL http://localhost:8890/api >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+volumes:
+  hf_cache:
+    name: sysdereco_hf_cache
+  torch_cache:
+    name: sysdereco_torch_cache

@@ -1,0 +1,60 @@
+# ---- ECR experiment runtime ---------------------------------------------
+# Base : image `nvcr.io/nvidia/pytorch:26.03-py3`. Elle fournit deja :
+#   torch, torchvision, torchaudio, numpy, pandas, scipy, scikit-learn, tqdm,
+#   matplotlib, PyYAML, jupyterlab>=4, ipykernel, regex, tokenizers, datasets,
+#   safetensors, huggingface-hub, requests.
+# On ne les re-liste pas ici : (1) pip echoue a desinstaller les paquets apt
+# (erreur `uninstall-no-record-file` pour wheel/PyYAML/pygments), (2) on evite
+# un re-download inutile, (3) on s'evite les downgrades (torch NVIDIA 2.11.0a).
+#
+# Article : python==3.8 / torch==1.8.1 / transformers==4.15 / accelerate==0.8 /
+# pyg==2.0.1. On cible la stack moderne compatible : transformers 4.x,
+# accelerate >= 0.28, peft >= 0.10, torch-geometric >= 2.5.
+
+# --- Visualisation ------------------------------------------------------
+seaborn
+
+# --- Jupyter widgets (manquants dans NGC) -------------------------------
+ipywidgets
+jupyterlab-widgets
+
+# --- NLP / corpus (requis par data/redial/process*.py) ------------------
+nltk
+gensim
+sentencepiece
+fuzzywuzzy
+python-Levenshtein
+
+# --- Hugging Face stack ECR ---------------------------------------------
+# /!\ transformers 5.x retire des APIs utilisees par le code ECR d'origine.
+# On reste sur la branche 4.x en prenant les plus recents patchs.
+transformers>=4.40,<5
+accelerate>=0.28,<1.2
+peft>=0.10,<0.14
+evaluate
+
+# --- Graph / RGCN (Section 4.2 - representations locales/globales) ------
+# Les extensions torch-scatter / torch-sparse sont optionnelles avec pyg >= 2.5.
+# Les activer a la demande via :
+#   pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-X.Y.Z+cuXYZ.html
+torch-geometric>=2.5
+
+# --- Metriques de generation (subjective eval - Section 5.6) -----------
+rouge-score
+sacrebleu
+bert-score
+
+# --- LoRA / ECR[Llama 2-Chat] (Section 4.3) -----------------------------
+bitsandbytes; platform_system == "Linux"
+
+# --- Runtime ECR (requis par src_emo/train_*.py et dataset_dbpedia.py) --
+wandb
+loguru
+
+# --- Utilitaires --------------------------------------------------------
+python-dotenv
+
+# --- Google Drive (archives emo_data / ckpt publiees par les auteurs) ---
+# gdown gere l'interstitiel "virus scan warning" que sert Google Drive pour
+# tout fichier > 100 MB (ckpt.zip pese 679 MB, emo_data.zip 111 MB).
+gdown>=5.2
