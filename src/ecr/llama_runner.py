@@ -127,6 +127,37 @@ def load_test_samples(jsonl_path: Path, limit: Optional[int] = None) -> List[Sam
     return samples
 
 
+def _dtype_kwarg_name():
+    """Retourne le nom du kwarg dtype supporte par la version de transformers.
+
+    `torch_dtype` etait le nom historique ; transformers 4.48+ a introduit le
+    nom canonique `dtype` (avec `torch_dtype` deprecie, emission d'un
+    `DeprecationWarning`). Comme les deux sont passes via `**kwargs` (pas de
+    signature explicite), on inspecte le code source de
+    `PreTrainedModel.from_pretrained` pour detecter la presence du pop de
+    `dtype`. Cache le resultat au module-level (une seule fois par process).
+    """
+    global _DTYPE_KWARG_CACHE
+    try:
+        return _DTYPE_KWARG_CACHE  # type: ignore[name-defined]
+    except NameError:
+        pass
+    import inspect
+    try:
+        from transformers import PreTrainedModel
+        src = inspect.getsource(PreTrainedModel.from_pretrained)
+        # La canonicalisation "dtype" a ete introduite en ~4.48. Si le pop
+        # explicite est present, on est sur une version qui deprecate
+        # `torch_dtype` -- on utilise directement `dtype`.
+        if 'kwargs.pop("dtype"' in src or "kwargs.pop('dtype'" in src:
+            _DTYPE_KWARG_CACHE = "dtype"
+        else:
+            _DTYPE_KWARG_CACHE = "torch_dtype"
+    except (ImportError, OSError, TypeError):
+        _DTYPE_KWARG_CACHE = "torch_dtype"
+    return _DTYPE_KWARG_CACHE
+
+
 def _load_model_with_fa2(model_dir, torch_dtype, device_map, token=None,
                           quantization_config=None, use_flash_attn_2=True):
     """Charge un modele HF en essayant Flash-Attention 2 d'abord, avec fallback sdpa.
@@ -137,12 +168,13 @@ def _load_model_with_fa2(model_dir, torch_dtype, device_map, token=None,
     deja 1.3-1.5x plus rapide que l'impl eager.
     """
     from transformers import AutoModelForCausalLM
-    kwargs = {"torch_dtype": torch_dtype, "device_map": device_map}
+    dtype_key = _dtype_kwarg_name()
+    kwargs = {dtype_key: torch_dtype, "device_map": device_map}
     if token is not None:
         kwargs["token"] = token
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
-        kwargs.pop("torch_dtype", None)
+        kwargs.pop(dtype_key, None)
     if use_flash_attn_2:
         try:
             return AutoModelForCausalLM.from_pretrained(
@@ -166,7 +198,18 @@ def generate_hf(
     temperature: float = 0.7,
     use_flash_attn_2: bool = True,
 ) -> List[Dict]:
-    """Inference via transformers (bf16). Support LoRA via peft + Flash-Attn 2."""
+    """Inference via transformers (bf16). Support LoRA via peft + Flash-Attn 2.
+
+    IMPORTANT : cette fonction charge Llama-2-7B (12.5 GB bf16) dans le process
+    Python appelant. On fait un `del model; del tokenizer; gc.collect();
+    torch.cuda.empty_cache()` EXPLICITE avant le return pour minimiser les refs
+    residuelles. NOTE : le CUDA context Python (~400-500 MB) persiste jusqu'a
+    la fin du process, empty_cache ne peut pas le recuperer. Si la VRAM doit
+    etre 100% rendue au driver (ex: avant de lancer Qwen 32B), il faut soit
+    redemarrer le kernel Python, soit encapsuler cet appel dans un subprocess
+    dedie (voir runbook Niveau 2).
+    """
+    import gc
     import torch
     from transformers import AutoTokenizer
 
@@ -185,61 +228,86 @@ def generate_hf(
         model = PeftModel.from_pretrained(model, lora_dir)
     model.eval()
 
-    outputs = []
-    for s in samples:
-        prompt = build_chat_prompt(s.history, s.item)
-        ids = tokenizer(prompt, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            gen = model.generate(
-                **ids,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=temperature > 0,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        text = tokenizer.decode(gen[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
-        outputs.append({
-            "dialogue_id": s.dialogue_id,
-            "item": s.item,
-            "response": text.strip(),
-            "ground_truth": s.ground_truth,
-        })
-    return outputs
+    try:
+        outputs = []
+        for s in samples:
+            prompt = build_chat_prompt(s.history, s.item)
+            ids = tokenizer(prompt, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                gen = model.generate(
+                    **ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=temperature > 0,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            text = tokenizer.decode(gen[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
+            outputs.append({
+                "dialogue_id": s.dialogue_id,
+                "item": s.item,
+                "response": text.strip(),
+                "ground_truth": s.ground_truth,
+            })
+        return outputs
+    finally:
+        # Nettoyage explicite : del avant gc pour que les tensors referencent
+        # plus de poids -> caching allocator libere au maximum.
+        try:
+            del model
+        except Exception:
+            pass
+        try:
+            del tokenizer
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
 
 def generate_vllm(
     samples: List[Sample],
     base_url: str = "http://localhost:8001/v1",
-    model_name: str = "meta-llama/Llama-2-7b-chat-hf",
+    model_name: str = "NousResearch/Llama-2-7b-chat-hf",
     api_key: str = "EMPTY",
     max_new_tokens: int = 150,
     temperature: float = 0.7,
 ) -> List[Dict]:
-    """Inference via vLLM (API OpenAI-compatible)."""
+    """Inference via vLLM (API OpenAI-compatible).
+
+    On utilise `/v1/completions` (prompt brut, pas de templating cote serveur)
+    plutot que `/v1/chat/completions` (messages -> apply_chat_template).
+
+    Raison : le tokenizer de Llama-2-chat (officiel Meta ET miroir
+    NousResearch) ne definit PAS de `chat_template` dans tokenizer_config.json.
+    Le fallback transformers a ete retire en 4.44, donc vLLM renvoie un
+    HTTP 400 "default chat template is no longer allowed" sur tout appel
+    chat. En pre-formatant le prompt cote client via `build_chat_prompt`
+    (template officiel Meta `<s>[INST]<<SYS>>...[/INST]`), on contourne ce
+    check ET on garantit la coherence bit-a-bit avec le path HF
+    (`generate_hf` qui utilise deja la meme fonction).
+
+    `stop=["</s>", "[INST]"]` coupe la generation si Llama tente d'ouvrir un
+    nouveau tour (eviter le sur-completion typique des LLM chat).
+    """
     from openai import OpenAI
 
     client = OpenAI(base_url=base_url, api_key=api_key)
     outputs = []
     for s in samples:
-        resp = client.chat.completions.create(
+        prompt = build_chat_prompt(s.history, s.item)
+        resp = client.completions.create(
             model=model_name,
-            messages=[
-                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Dialogue history:\n{s.history.strip()}\n\n"
-                        f"Recommended movie: {s.item.strip()}\n\nYour reply:"
-                    ),
-                },
-            ],
+            prompt=prompt,
             max_tokens=max_new_tokens,
             temperature=temperature,
+            stop=["</s>", "[INST]"],
         )
         outputs.append({
             "dialogue_id": s.dialogue_id,
             "item": s.item,
-            "response": resp.choices[0].message.content.strip(),
+            "response": resp.choices[0].text.strip(),
             "ground_truth": s.ground_truth,
         })
     return outputs

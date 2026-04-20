@@ -54,7 +54,50 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (wheel/PyYAML/pygments) et pour ne pas casser la contrainte dali/packaging.
 # -> requirements.txt ne liste que les paquets *manquants* pour ECR.
 COPY requirements.txt /workspace/requirements.txt
-RUN pip install -r /workspace/requirements.txt
+
+# `--no-build-isolation` est indispensable pour flash-attn : son `setup.py`
+# fait `import torch` a l'etape de build, mais un build isole ne voit PAS le
+# torch global de l'image NGC (il cree un venv temporaire vide). Avec
+# `--no-build-isolation`, pip utilise le site-packages existant -> torch visible,
+# la compilation reussit. Accessoirement ca accelere le build (pas de reinstall
+# redondant des build-deps). L'ancien `|| true` masquait silencieusement cet
+# echec ; tous les paquets de requirements.txt n'etaient alors PAS installes.
+RUN pip install --no-build-isolation -r /workspace/requirements.txt
+
+# --- Gel des versions torch / torchvision / torchaudio / flash-attn / vllm ---
+#
+# Probleme : vllm 0.19.x declare des pins stricts `torchaudio==2.10.0` +
+# `torchvision==0.25.0` qui, transitivement, forcent `torch==2.10.0`. Si on
+# part de la build torch 2.11.0a0 fournie par l'image NGC, le premier
+# `pip install` avec vllm deprend/remplace torch (dezipagge ~1 Go de wheels
+# cuda). Une fois torch remplace, ca reste ; mais tout `pip install <paquet>`
+# ulterieur dans le conteneur peut a nouveau tenter de re-jouer la resolution
+# de dependances si l'utilisateur n'utilise pas `--no-build-isolation`.
+#
+# Solution : on fige les versions observees apres install dans le fichier
+# pointe par `PIP_CONSTRAINT` (convention NGC : `/etc/pip/constraint.txt`).
+# Tout futur `pip install` dans le conteneur refusera alors d'upgrader ou
+# downgrader ces paquets. Si un utilisateur ajoute un paquet dont la dep
+# entre en conflit, pip le lui dira explicitement au lieu de reinstaller
+# silencieusement ~2-3 Go de torch+cuda wheels.
+RUN python - <<'PY' >> /etc/pip/constraint.txt
+import importlib.metadata as _md
+_PINS = (
+    "torch", "torchvision", "torchaudio", "triton",
+    "flash-attn", "vllm",
+    "torch-geometric",
+    "transformers", "accelerate", "peft", "bitsandbytes",
+    "numpy", "numba", "protobuf",
+)
+print("# --- Auto-generated pins (Dockerfile) : empeche pip de reinstaller ---")
+for _p in _PINS:
+    try:
+        print(f"{_p}=={_md.version(_p)}")
+    except _md.PackageNotFoundError:
+        pass
+PY
+RUN echo "[pip-constraint] contenu final de /etc/pip/constraint.txt :" \
+ && cat /etc/pip/constraint.txt
 
 # Corpus NLTK necessaires aux scripts `data/redial/process*.py` + generation
 RUN mkdir -p "${NLTK_DATA}" && \

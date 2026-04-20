@@ -20,6 +20,50 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
+# ---------------------------------------------------------------------------
+# Compat shim transformers 4.57 <-> accelerate < 1.3
+# ---------------------------------------------------------------------------
+#
+# A partir de transformers ~4.50, `Trainer._wrap_model` appelle
+# `self.accelerator.unwrap_model(model, keep_torch_compile=False)`. Le kwarg
+# `keep_torch_compile` a ete AJOUTE dans accelerate 1.3.0 (nov 2024). Sur
+# accelerate < 1.3 (notamment 1.1.1 pinne par notre constraint NGC actuel),
+# le kwarg leve TypeError.
+#
+# Cette fonction detecte la situation au runtime et wrappe `unwrap_model` pour
+# absorber le kwarg inconnu. Une fois accelerate >= 1.3 installe (future build
+# Docker qui aura la contrainte relachee), le shim se transforme en no-op.
+# Idempotent : safe a appeler plusieurs fois.
+def _ensure_accelerator_unwrap_compat() -> None:
+    try:
+        import inspect as _inspect
+        from accelerate import Accelerator as _Accelerator
+    except ImportError:
+        return
+    if getattr(_Accelerator.unwrap_model, "_ecr_shimmed", False):
+        return  # deja patche
+    try:
+        sig = _inspect.signature(_Accelerator.unwrap_model)
+    except (TypeError, ValueError):
+        return
+    if "keep_torch_compile" in sig.parameters:
+        return  # accelerate >= 1.3, rien a faire
+
+    _original_unwrap = _Accelerator.unwrap_model
+
+    def _patched_unwrap(self, model, keep_fp32_wrapper=True,
+                         keep_torch_compile=None, **kwargs):
+        # `keep_torch_compile` est ignore (comportement accelerate < 1.3 :
+        # le `torch.compile` wrapper etait deja unwrap par defaut).
+        return _original_unwrap(self, model,
+                                 keep_fp32_wrapper=keep_fp32_wrapper, **kwargs)
+
+    _patched_unwrap._ecr_shimmed = True  # marker anti-double-patch
+    _Accelerator.unwrap_model = _patched_unwrap
+    print("[lora] shim installe : Accelerator.unwrap_model accepte "
+          "keep_torch_compile= pour compat transformers 4.57 (accelerate < 1.3)")
+
+
 PROMPT_TEMPLATE = (
     "<s>[INST] <<SYS>>\n"
     "You are an empathetic movie recommendation assistant. Respond to the user "
@@ -85,6 +129,11 @@ def train_lora(
 
     Retourne le chemin de l'adapter sauve (peut etre charge par peft).
     """
+    # Compat shim obligatoire AVANT d'importer Trainer : corrige TypeError sur
+    # `Accelerator.unwrap_model(..., keep_torch_compile=False)` que transformers
+    # 4.57 emet. No-op si accelerate >= 1.3.
+    _ensure_accelerator_unwrap_compat()
+
     import torch
     from datasets import Dataset
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -184,8 +233,36 @@ def train_lora(
     )
 
     trainer = Trainer(model=model, args=args, train_dataset=ds, data_collator=collator)
-    trainer.train()
-
-    model.save_pretrained(str(output_dir))
-    tokenizer.save_pretrained(str(output_dir))
-    return output_dir
+    try:
+        trainer.train()
+        model.save_pretrained(str(output_dir))
+        tokenizer.save_pretrained(str(output_dir))
+        return output_dir
+    finally:
+        # Nettoyage VRAM agressif : training LoRA sur Llama-2-7B bf16 peak
+        # autour de 18-25 GB (poids + activations + gradients + optimizer).
+        # Sans `del` explicite, le trainer + le model + l'optimizer + les
+        # dataloaders restent reachables pendant toute la vie du kernel
+        # Jupyter, bloquant plusieurs GB qu'on ne pourrait pas ceder au
+        # scorer Qwen en phase 4. `gc.collect` + `empty_cache` ne recuperent
+        # rien tant qu'il y a des references Python vivantes.
+        # NB : `del locals()[name]` ne fonctionne PAS en scope fonction
+        # (locals() est un snapshot), d'ou les dels explicites ci-dessous
+        # avec try/except pour le cas ou un nom a ete shadowe/reassigne.
+        import gc
+        try: del trainer
+        except Exception: pass
+        try: del model
+        except Exception: pass
+        try: del tokenizer
+        except Exception: pass
+        try: del collator
+        except Exception: pass
+        try: del ds
+        except Exception: pass
+        try: del examples
+        except Exception: pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()

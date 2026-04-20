@@ -15,7 +15,9 @@ parsing echoue (temperature ramenee a 0 au 2e essai).
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -79,7 +81,15 @@ def launch_vllm_server(
     """Demarre `vllm serve` en background. Retourne le handle du process.
 
     Retourne None si `vllm` n'est pas installe (impossible d'importer).
-    A killer via `proc.terminate()` (ou `proc.kill()`) en fin de scoring.
+    A killer via `kill_vllm_proc_tree(proc)` en fin de scoring pour garantir
+    que les enfants (EngineCore, NCCL workers) soient tous SIGTERMs.
+
+    On utilise `os.setsid` (via `start_new_session`) pour que le process vLLM
+    demarre dans un NOUVEAU process group dont il est le leader. Cela permet
+    ensuite a `os.killpg(os.getpgid(proc.pid), SIGTERM)` de propager le signal
+    a TOUS les enfants -- sinon ils peuvent survivre en zombies/orphelins et
+    retenir de la VRAM (observe dans les dumps live : `[python3] <defunct>
+    ppid=1` apres un simple proc.terminate()).
     """
     import shutil as _sh
     if _sh.which("vllm") is None:
@@ -101,12 +111,122 @@ def launch_vllm_server(
     log_f = log_path.open("w")
     print(f"[scorer] vllm serve {model} -> {log_path}")
     try:
-        proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+        popen_kwargs = {
+            "stdout": log_f,
+            "stderr": subprocess.STDOUT,
+            # `start_new_session=True` == os.setsid() POSIX. Le parent et le
+            # shell Python restent dans leur session d'origine.
+            "start_new_session": True,
+        }
+        proc = subprocess.Popen(cmd, **popen_kwargs)
     except Exception as exc:
         print(f"[scorer] echec demarrage vllm: {exc}")
         log_f.close()
         return None
     return proc
+
+
+def _pgid_has_members(pgid: int) -> bool:
+    """True s'il reste au moins un process VIVANT dans ce process group.
+
+    Les zombies (STAT=Z) sont exclus : ils sont deja morts (VRAM liberee par
+    le kernel), ils attendent juste d'etre reap'es par leur parent (init).
+    Les compter comme "survivants" declencherait un SIGKILL inutile et
+    loggerait faussement un timeout a chaque teardown.
+    """
+    try:
+        r = subprocess.run(
+            ["ps", "-e", "-o", "pid,pgid,stat"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        # FileNotFoundError herite de OSError, meme catch.
+        return False
+    if r.returncode != 0:
+        return False
+    token = f" {pgid} "
+    for line in r.stdout.splitlines():
+        if token not in line:
+            continue
+        # Dernier champ = STAT (ex: "S", "R", "Z<", "D+", etc.)
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        stat = parts[-1]
+        if stat.startswith("Z"):
+            continue  # zombie -> process mort, ne compte pas
+        return True
+    return False
+
+
+def kill_vllm_proc_tree(proc: Optional[subprocess.Popen], timeout: int = 30) -> None:
+    """Envoie SIGTERM (puis SIGKILL) a tout le process group de `proc`.
+
+    Utilise `os.killpg(os.getpgid(proc.pid), SIGTERM)` pour atteindre les
+    enfants crees par vLLM (EngineCore, workers NCCL). Sans ca, seul le
+    wrapper principal recoit SIGTERM et les enfants deviennent orphelins
+    re-adoptes par init -- observe en live sur 5090 avec des zombies
+    `[python3] <defunct> ppid=1` qui pouvaient retenir de la VRAM.
+
+    IMPORTANT : `proc.wait()` ne voit QUE le process direct de `Popen`. Si
+    l'enfant immediat meurt rapidement mais laisse un petit-enfant actif
+    dans le meme pgid, proc.wait returns OK alors que le pgid contient
+    encore des survivants. On verifie donc avec `pgrep -g <pgid>` et on
+    escalade en SIGKILL si besoin. Idempotent.
+    """
+    if proc is None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        # Process deja mort ou pgid inaccessible -> fallback sur proc direct.
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=timeout)
+            except Exception:
+                # TimeoutExpired et autres -> SIGKILL direct.
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        return
+
+    # 1. SIGTERM au groupe entier (cooperation-friendly).
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    # Attendre que le groupe ENTIER se vide, pas juste le process direct.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None and not _pgid_has_members(pgid):
+            return
+        time.sleep(0.1)
+
+    # 2. Timeout -> SIGKILL au groupe.
+    if _pgid_has_members(pgid):
+        print(f"[scorer] kill_vllm_proc_tree: SIGTERM timeout {timeout}s "
+              f"(pgid={pgid} non vide) -> SIGKILL")
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # Attendre le vidage final (max 10s supplementaires).
+        deadline2 = time.time() + 10
+        while time.time() < deadline2:
+            if not _pgid_has_members(pgid):
+                break
+            time.sleep(0.1)
+    # Reap du process direct si pas encore fait.
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
 
 def wait_vllm_ready(port: int = 8000, timeout: int = 600) -> bool:
@@ -122,7 +242,8 @@ def wait_vllm_ready(port: int = 8000, timeout: int = 600) -> bool:
                 if r.status == 200:
                     print(f"[scorer] vllm ready on :{port}")
                     return True
-        except (urllib.error.URLError, OSError):
+        except OSError:
+            # URLError herite de OSError, meme catch.
             pass
         time.sleep(5)
     print(f"[scorer] timeout apres {timeout}s")

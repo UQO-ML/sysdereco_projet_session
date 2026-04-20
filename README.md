@@ -173,7 +173,13 @@ En cas d'echec reseau / quota Google Drive :
 2. deposer manuellement `ckpt.zip` dans `data/ckpt.zip` ;
 3. relancer la cellule d'import de donnees — elle decompresse vers `data/emo_data/` et `data/ckpt/`.
 
-**Llama 2-7B-Chat** (modele gated sur HuggingFace) necessite `HF_TOKEN` dans `.env` et l'acceptation de la licence (gratuit, ~5 min de validation auto sur [la page HF](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf)).
+**Llama 2-7B-Chat** : par defaut on utilise le miroir public
+[`NousResearch/Llama-2-7b-chat-hf`](https://huggingface.co/NousResearch/Llama-2-7b-chat-hf)
+(poids identiques bit-a-bit, licence Llama 2 CLA, **aucune approbation manuelle**).
+Pour repasser sur le repo officiel [`meta-llama/Llama-2-7b-chat-hf`](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf)
+(gated) : accepter la licence sur la page HF (~quelques heures de validation),
+definir `HF_TOKEN=hf_xxx` dans `.env`, puis changer `llama_base_model` dans
+`get_config()`. Aucun autre impact (tokenizer, template chat, config identiques).
 
 ## Flags d'execution (`get_config()`)
 
