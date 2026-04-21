@@ -64,47 +64,83 @@ def _ensure_accelerator_unwrap_compat() -> None:
           "keep_torch_compile= pour compat transformers 4.57 (accelerate < 1.3)")
 
 
+# ---------------------------------------------------------------------------
+# Template prompt pour ECR[Llama 2-Chat]
+# ---------------------------------------------------------------------------
+#
+# Le format REEL du dataset `llama_train.json` fourni par les auteurs suit une
+# structure Alpaca-style `{instruction, input, output}` (pas `{context,
+# emotion, item, review}` comme on aurait pu le penser). Exemple d'une entree :
+#
+#   {
+#     "instruction": "You are a recommender chatting with the user to provide
+#                     movie recommendation. Please continue generating based on
+#                     the First Sentence. Please utilize the information about
+#                     Movie Name, Related Entities, and Related Knowledge from
+#                     KG.",
+#     "input": "Movie Name: The Man Who Knew Infinity (2015)\n"
+#              "Related Entities: Full moon, Amazing Stories, Education, ...\n"
+#              "Related Knowledge from KG: None\n"
+#              "First Sentence: I haven't seen that one. I have ...",
+#     "output": "Anyone who rates this movie under the 7 is insensible ..."
+#   }
+#
+# Le modele est entraine a CONTINUER la "First Sentence" presente dans le
+# champ `input`, en s'appuyant sur le nom de film + entites + knowledge KG.
+# C'est un task de "review continuation" empathique, pas un task de chat
+# multi-tour classique. Pour l'inference, on utilise `llama_test.json` (format
+# identique, output vide), on construit le meme prompt, et on decode la
+# continuation.
 PROMPT_TEMPLATE = (
     "<s>[INST] <<SYS>>\n"
-    "You are an empathetic movie recommendation assistant. Respond to the user "
-    "with emotional awareness using the provided emotion tag, and recommend the "
-    "given movie with a brief motivation rooted in the movie's themes.\n"
+    "{instruction}\n"
     "<</SYS>>\n\n"
-    "Dialogue history:\n{history}\n\n"
-    "User emotion: {emotion}\n"
-    "Recommended movie: {item}\n\n"
-    "Write the empathetic reply: [/INST] "
+    "{input} [/INST] "
 )
 
 
 def _load_llama_json(path: Path) -> List[Dict]:
-    """Charge `llama_train.json` / `llama_test.json` de l'archive `emo_data.zip`.
+    """Charge `llama_train.json` / `llama_test.json` (format Alpaca ECR).
 
-    Format attendu (depuis l'archive ECR) :
-        [
-            {"context": [...], "emotion": "happy", "item": "Inception (2010)",
-             "review": "... empathetic review text ..."},
-            ...
-        ]
+    Format attendu :
+        [{"instruction": "...", "input": "...", "output": "..."}, ...]
     """
     with Path(path).open() as f:
         data = json.load(f)
     return data
 
 
+def build_lora_prompt(instruction: str, input_text: str) -> str:
+    """Construit un prompt LoRA identique a celui du training.
+
+    Utilise par `train_lora` (via `build_training_examples`) et par l'inference
+    `generate_hf_lora` dans `llama_runner.py`. Garder cette fonction comme
+    SOURCE UNIQUE de verite pour le template -- tout mismatch train/infer
+    donne des sorties polluees de placeholders comme `[Insert the user's
+    emotion]` (observe en pratique avec l'ancien template).
+    """
+    return PROMPT_TEMPLATE.format(
+        instruction=str(instruction).strip(),
+        input=str(input_text).strip(),
+    )
+
+
 def build_training_examples(path: Path) -> List[Dict[str, str]]:
-    """Format {"text": prompt+target} pour `datasets.Dataset.from_list`."""
+    """Format {"prompt": ..., "target": ...} pour `datasets.Dataset.from_list`."""
     raw = _load_llama_json(path)
     examples = []
     for row in raw:
-        history = "\n".join(row.get("context", []))
-        prompt = PROMPT_TEMPLATE.format(
-            history=history,
-            emotion=row.get("emotion", "neutral"),
-            item=row.get("item", ""),
-        )
-        target = str(row.get("review", "")).strip() + " </s>"
-        examples.append({"prompt": prompt, "target": target})
+        instruction = str(row.get("instruction", "")).strip()
+        input_text = str(row.get("input", "")).strip()
+        output_text = str(row.get("output", "")).strip()
+        if not instruction or not input_text or not output_text:
+            # Ligne invalide -> skip (evite d'empoisonner le LoRA avec des
+            # exemples vides, ce qui etait le bug du template precedent).
+            continue
+        examples.append({
+            "prompt": build_lora_prompt(instruction, input_text),
+            "target": output_text + " </s>",
+        })
     return examples
 
 
@@ -140,7 +176,7 @@ def train_lora(
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
-        DataCollatorForLanguageModeling,
+        DataCollatorForSeq2Seq,
         Trainer,
         TrainingArguments,
     )
@@ -182,6 +218,11 @@ def train_lora(
     else:
         model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
     if use_4bit:
+        # `prepare_model_for_kbit_training` active gradient_checkpointing en
+        # interne (avec use_reentrant=True par defaut, warning benin sur torch
+        # 2.10+ mais fatal sur 2.9). On pourrait passer
+        # gradient_checkpointing_kwargs={"use_reentrant": False} ici mais la
+        # signature varie selon la version de peft -- on laisse le defaut.
         model = prepare_model_for_kbit_training(model)
 
     peft_cfg = LoraConfig(
@@ -193,6 +234,20 @@ def train_lora(
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, peft_cfg)
+
+    # Gradient checkpointing aussi en path bf16 : SANS ca, Llama-2-7B bf16
+    # + batch 4 + seq 1024 sature les 32 GB d'une 5090 (activations non
+    # checkpointees = ~10-12 GB). En path 4-bit, prepare_model_for_kbit_training
+    # l'a deja active. On evite le double-enable.
+    if not use_4bit:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        # requis pour PEFT + gradient_checkpointing : les embeddings d'entree
+        # doivent exposer require_grad pour que la chaine de gradients traverse
+        # les couches checkpointees vers les adapters LoRA.
+        model.enable_input_require_grads()
+
     model.print_trainable_parameters()
 
     examples = build_training_examples(train_json)
@@ -216,7 +271,7 @@ def train_lora(
 
     ds = ds.map(tokenize_fn, remove_columns=ds.column_names)
 
-    collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    collator = DataCollatorForSeq2Seq(tokenizer)
 
     args = TrainingArguments(
         output_dir=str(output_dir),
@@ -230,6 +285,14 @@ def train_lora(
         save_total_limit=1,
         report_to=[],
         optim="paged_adamw_8bit" if use_4bit else "adamw_torch",
+        # Note : en 4-bit le checkpointing est DEJA actif via
+        # `prepare_model_for_kbit_training`. En bf16 il est active manuellement
+        # ci-dessus (`model.gradient_checkpointing_enable(...)`). On garde
+        # `gradient_checkpointing=True` ici + `use_reentrant=False` pour que
+        # le Trainer de transformers detecte l'etat et ne re-active pas
+        # redondamment.
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
     trainer = Trainer(model=model, args=args, train_dataset=ds, data_collator=collator)

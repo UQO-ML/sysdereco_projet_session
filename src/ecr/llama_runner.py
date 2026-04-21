@@ -48,6 +48,11 @@ class Sample:
     history: str
     item: str
     ground_truth: Optional[str] = None
+    # Champs specifiques au task LoRA (format Alpaca {instruction, input, output}
+    # de `llama_train.json`). Laisses a None pour le path zero-shot (qui
+    # construit son prompt via `build_chat_prompt`).
+    instruction: Optional[str] = None
+    raw_input: Optional[str] = None
 
 
 def build_chat_prompt(history: str, item: str, system: str = DEFAULT_SYSTEM_PROMPT) -> str:
@@ -66,6 +71,64 @@ def build_chat_prompt(history: str, item: str, system: str = DEFAULT_SYSTEM_PROM
     return (
         f"<s>[INST] <<SYS>>\n{system.strip()}\n<</SYS>>\n\n{user} [/INST]"
     )
+
+
+def build_prompt_for_sample(sample: "Sample") -> str:
+    """Dispatch automatique zero-shot vs LoRA en fonction des champs presents.
+
+    - Si `sample.instruction` et `sample.raw_input` sont definis -> format LoRA
+      (identique a celui du training llama_lora.py, evite le mismatch
+      train/infer qui produisait des placeholders non resolus en sortie).
+    - Sinon -> format zero-shot `build_chat_prompt`.
+    """
+    if sample.instruction and sample.raw_input:
+        # Import local pour eviter une dep circulaire.
+        from .llama_lora import build_lora_prompt
+        return build_lora_prompt(sample.instruction, sample.raw_input)
+    return build_chat_prompt(sample.history, sample.item)
+
+
+def load_llama_lora_test_samples(
+    json_path: Path, limit: Optional[int] = None,
+) -> List[Sample]:
+    """Charge `llama_test.json` (format Alpaca `{instruction, input, output}`).
+
+    Utilise POUR ECR[Llama 2-Chat] LoRA uniquement. Le format est different
+    du dataset zero-shot (qui passe par `load_test_samples` sur
+    `test_data_dbpedia_emo.jsonl`). Le `input` contient :
+        Movie Name: <name>
+        Related Entities: <ents>
+        Related Knowledge from KG: <kg>
+        First Sentence: <first sentence>
+    Le modele LoRA est entraine a CONTINUER la First Sentence (pas a
+    repondre "from scratch"). On extrait le nom du film via regex pour
+    populer `Sample.item`, et on stocke le `input` complet dans
+    `Sample.raw_input` pour reconstruire le prompt via `build_lora_prompt`
+    (meme template que training -> zero mismatch).
+    """
+    import re as _re
+    path = Path(json_path)
+    with path.open() as f:
+        raw = json.load(f)
+
+    samples: List[Sample] = []
+    for idx, row in enumerate(raw):
+        instruction = str(row.get("instruction", "")).strip()
+        input_text = str(row.get("input", "")).strip()
+        gt = row.get("output") or None
+        m = _re.search(r"Movie Name:\s*(.+)", input_text)
+        item = m.group(1).strip() if m else ""
+        samples.append(Sample(
+            dialogue_id=str(row.get("id", idx)),
+            history=input_text,  # passe au scorer comme contexte lisible
+            item=item,
+            ground_truth=(gt.strip() if isinstance(gt, str) and gt.strip() else None),
+            instruction=instruction,
+            raw_input=input_text,
+        ))
+        if limit and len(samples) >= limit:
+            break
+    return samples
 
 
 def load_test_samples(jsonl_path: Path, limit: Optional[int] = None) -> List[Sample]:
@@ -231,7 +294,11 @@ def generate_hf(
     try:
         outputs = []
         for s in samples:
-            prompt = build_chat_prompt(s.history, s.item)
+            # Dispatch selon type de sample : LoRA (instruction/raw_input) ou
+            # zero-shot (history/item). Garantit zero mismatch train/infer
+            # pour le LoRA, qui produisait des placeholders non resolus quand
+            # on le drivait avec build_chat_prompt (bug initial).
+            prompt = build_prompt_for_sample(s)
             ids = tokenizer(prompt, return_tensors="pt").to(model.device)
             with torch.no_grad():
                 gen = model.generate(
@@ -296,7 +363,8 @@ def generate_vllm(
     client = OpenAI(base_url=base_url, api_key=api_key)
     outputs = []
     for s in samples:
-        prompt = build_chat_prompt(s.history, s.item)
+        # Meme dispatcher que generate_hf : LoRA ou zero-shot automatiquement.
+        prompt = build_prompt_for_sample(s)
         resp = client.completions.create(
             model=model_name,
             prompt=prompt,
